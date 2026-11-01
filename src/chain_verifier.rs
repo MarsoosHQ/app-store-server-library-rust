@@ -1,12 +1,37 @@
+//! Verifies the certificate chain Apple signs App Store data with, as Apple's own libraries
+//! verify it: the leaf (Apple's receipt signer), issued by the intermediate (Apple Worldwide
+//! Developer Relations), issued by one of the trusted roots. With online checks, both
+//! certificates' revocation status is asked of their issuer's OCSP responder (see
+//! [`crate::ocsp`]), and a chain that verified is remembered for 15 minutes.
+//!
+//! Apple's chains are always these three certificates, so this checks exactly that shape
+//! instead of building paths: the names linking each certificate to its issuer; every
+//! signature (ECDSA with SHA-256 or SHA-384, the outer and inner algorithms the same); the
+//! validity dates at the effective time; that both issuers are CAs (basic constraints, room in
+//! any path length, and key usage, when present, that includes keyCertSign); that the leaf
+//! isn't a CA and may sign (digitalSignature, when key usage is present); that no critical
+//! extension goes unchecked; and Apple's OIDs on the leaf and the intermediate. The third
+//! certificate a JWS carries isn't used: the root must be one of the trusted ones.
+//!
+//! Strict checks, on unless turned off, add the rules OpenSSL's `X509_STRICT` adds, which
+//! Apple's libraries set by default: every certificate is version 3 and names its issuer and
+//! subject; a CA's basic constraints are critical, and it has key usage and a subject key
+//! identifier; only a CA may have a path length or keyCertSign; and the leaf and the
+//! intermediate name their issuer's key (an authority key identifier). Apple's chains meet
+//! them; its test certificates don't, so its tests turn them off.
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use der::asn1::ObjectIdentifier;
+use der::Encode;
 use thiserror::Error;
-use x509_validator::rfc5280::RFC5280Policy;
-use x509_validator::store::CertificateStore;
-use x509_validator::unverified_chain::UnverifiedCertificateChain;
-use x509_validator::{Certificate, CertificateExt, Oid, PolicyEvaluationResult, PolicyFailureReason, ValidationPolicy};
+use x509_cert::certificate::Version;
+use x509_cert::ext::pkix::{AuthorityKeyIdentifier, BasicConstraints, KeyUsage, SubjectKeyIdentifier};
+
+use crate::ocsp::{self, OcspFetcher};
+use crate::x509::Cert;
 
 #[derive(Error, Debug, PartialEq)]
 pub enum ChainVerifierError {
@@ -25,73 +50,39 @@ pub enum ChainVerificationFailureReason {
     #[error("InvalidAppIdentifier")]
     InvalidAppIdentifier,
 
+    /// A certificate or a trusted root couldn't be read, or there are no trusted roots.
     #[error("InvalidCertificate")]
     InvalidCertificate,
 
     #[error("InvalidChainLength")]
     InvalidChainLength,
+
+    /// The chain doesn't verify: an issuer, a signature, a date, a CA or key-usage rule, a
+    /// critical extension left unchecked, or Apple's OIDs.
+    #[error("InvalidChain")]
+    InvalidChain,
+
+    /// An OCSP responder answered, but not that the certificate is good (revoked, unknown,
+    /// not signed by the issuer or its delegate, or stale), or none was named to ask.
+    #[error("RevocationCheckFailed")]
+    RevocationCheckFailed,
+
+    /// An OCSP responder couldn't be reached, or didn't answer 200: try again later.
+    #[error("RetryableVerificationFailure")]
+    RetryableVerificationFailure,
 }
 
 /// Apple's receipt-signing OID, expected on the leaf certificate.
-const APPLE_RECEIPT_SIGNER_OID: &str = "1.2.840.113635.100.6.11.1";
+const APPLE_RECEIPT_SIGNER_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113635.100.6.11.1");
 /// Apple's WWDR OID, expected on the intermediate certificate.
-const APPLE_WWDR_INTERMEDIATE_OID: &str = "1.2.840.113635.100.6.2.1";
-/// leaf, intermediate, root.
-const EXPECTED_CHAIN_LENGTH: usize = 3;
+const APPLE_WWDR_INTERMEDIATE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113635.100.6.2.1");
 
-struct AppStoreOidPolicy {
-    wwdr_oid: Oid<'static>,
-    receipt_signer_oid: Oid<'static>,
-}
-
-impl AppStoreOidPolicy {
-    fn new() -> Self {
-        Self {
-            wwdr_oid: APPLE_WWDR_INTERMEDIATE_OID
-                .parse()
-                .expect("valid OID"),
-            receipt_signer_oid: APPLE_RECEIPT_SIGNER_OID
-                .parse()
-                .expect("valid OID"),
-        }
-    }
-
-    fn certificate_has_oid(certificate: &Certificate, oid: &Oid<'static>) -> bool {
-        certificate
-            .tbs_certificate
-            .iter_extensions()
-            .any(|ext| &ext.oid == oid)
-    }
-}
-
-impl ValidationPolicy for AppStoreOidPolicy {
-    fn verifying_critical_extensions(&self) -> Vec<Oid<'static>> {
-        vec![]
-    }
-
-    fn chain_meets_policy_requirements(&self, chain: &UnverifiedCertificateChain) -> PolicyEvaluationResult {
-        if chain.len() != EXPECTED_CHAIN_LENGTH {
-            return Err(PolicyFailureReason::new("chain has unexpected length"));
-        }
-
-        let leaf = &chain[0];
-        let intermediate = &chain[1];
-
-        if !Self::certificate_has_oid(intermediate, &self.wwdr_oid) {
-            return Err(PolicyFailureReason::new(
-                "intermediate certificate does not contain WWDR OID",
-            ));
-        }
-
-        if !Self::certificate_has_oid(leaf, &self.receipt_signer_oid) {
-            return Err(PolicyFailureReason::new(
-                "leaf certificate does not contain Receipt Signing OID",
-            ));
-        }
-
-        Ok(())
-    }
-}
+/// The extensions a chain's certificates may mark critical: those checked here.
+const CHECKED_CRITICAL: [ObjectIdentifier; 3] = [
+    ObjectIdentifier::new_unwrap("2.5.29.19"), // basic constraints
+    ObjectIdentifier::new_unwrap("2.5.29.15"), // key usage
+    ObjectIdentifier::new_unwrap("2.5.29.37"), // extended key usage
+];
 
 /// There are unlikely to be more than a couple of keys at once.
 const MAXIMUM_CACHE_SIZE: usize = 32;
@@ -112,16 +103,26 @@ struct CacheValue {
 /// Verifies Apple's certificate chains.
 pub struct ChainVerifier {
     root_certificates: Vec<Vec<u8>>,
+    strict_checks: bool,
     verified_public_key_cache: Mutex<HashMap<CacheKey, CacheValue>>,
 }
 
 impl ChainVerifier {
-    /// Creates a verifier trusting the given DER-encoded root certificates.
+    /// Creates a verifier trusting the given DER-encoded root certificates, with strict checks.
     pub fn new(root_certificates: Vec<Vec<u8>>) -> Self {
         Self {
             root_certificates,
+            strict_checks: true,
             verified_public_key_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Turns the strict checks (see the module's documentation) on or off. They're on by
+    /// default, as in Apple's libraries; turn them off only for test certificates, which have
+    /// no key identifiers.
+    pub fn with_strict_checks(mut self, enabled: bool) -> Self {
+        self.strict_checks = enabled;
+        self
     }
 
     /// Verifies the chain and returns the leaf's DER-encoded SubjectPublicKeyInfo.
@@ -129,52 +130,46 @@ impl ChainVerifier {
     /// # Arguments
     /// * `leaf` - DER-encoded leaf certificate
     /// * `intermediate` - DER-encoded intermediate certificate
-    /// * `effective_date` - Optional Unix timestamp for validity checks
-    /// * `enable_online_checks` - Whether the verified public key is cached,
-    ///   matching the official Apple libraries. Revocation checking is not
-    ///   performed.
+    /// * `effective_date` - Unix seconds at which the certificates must be valid; now when
+    ///   `None`
+    /// * `ocsp` - With a fetcher, online checks: both certificates' revocation status is
+    ///   checked with their issuer's OCSP responder, and a verified chain's key is cached for
+    ///   15 minutes, as Apple's libraries do. Without one, no revocation check is made.
     pub fn verify(
         &self,
         leaf: &[u8],
         intermediate: &[u8],
         effective_date: Option<u64>,
-        enable_online_checks: bool,
+        ocsp: Option<&dyn OcspFetcher>,
     ) -> Result<Vec<u8>, ChainVerifierError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.verify_at(
-            leaf,
-            intermediate,
-            effective_date,
-            enable_online_checks,
-            now,
-        )
+        self.verify_at(leaf, intermediate, effective_date, ocsp, now)
     }
 
-    /// [`ChainVerifier::verify`], with the current time injected. Exposed for
-    /// deterministic testing of cache expiry.
+    /// [`ChainVerifier::verify`], with the current time injected. Exposed for deterministic
+    /// testing of cache expiry and OCSP freshness.
     pub fn verify_at(
         &self,
         leaf: &[u8],
         intermediate: &[u8],
         effective_date: Option<u64>,
-        enable_online_checks: bool,
+        ocsp: Option<&dyn OcspFetcher>,
         now: u64,
     ) -> Result<Vec<u8>, ChainVerifierError> {
-        if enable_online_checks {
+        if ocsp.is_some() {
             if let Some(cached) = self.cached_public_key(leaf, intermediate, now) {
                 return Ok(cached);
             }
         }
 
-        let public_key = self.verify_without_caching(leaf, intermediate, effective_date)?;
+        let public_key = self.verify_without_caching(leaf, intermediate, effective_date.unwrap_or(now), ocsp, now)?;
 
-        if enable_online_checks {
+        if ocsp.is_some() {
             self.store_public_key(leaf, intermediate, &public_key, now);
         }
-
         Ok(public_key)
     }
 
@@ -190,42 +185,56 @@ impl ChainVerifier {
         &self,
         leaf: &[u8],
         intermediate: &[u8],
-        effective_date: Option<u64>,
+        effective_date: u64,
+        ocsp: Option<&dyn OcspFetcher>,
+        now: u64,
     ) -> Result<Vec<u8>, ChainVerifierError> {
-        let leaf = parse_certificate(leaf)?;
-        let intermediate = parse_certificate(intermediate)?;
+        if self.root_certificates.is_empty() {
+            return Err(failure(ChainVerificationFailureReason::InvalidCertificate));
+        }
+        let roots = self
+            .root_certificates
+            .iter()
+            .map(|der| parse(der))
+            .collect::<Result<Vec<_>, _>>()?;
+        let leaf = parse(leaf)?;
+        let intermediate = parse(intermediate)?;
 
-        let mut roots = CertificateStore::new();
-        for root_der in &self.root_certificates {
-            let root = parse_certificate(root_der)?;
-            roots.append(root);
+        let root = roots
+            .iter()
+            .find(|root| intermediate.signed_by(root))
+            .ok_or_else(|| failure(ChainVerificationFailureReason::InvalidChain))?;
+        let chain = [&leaf, &intermediate, root];
+        let holds = leaf.signed_by(&intermediate)
+            && chain
+                .iter()
+                .all(|cert| cert.valid_at(effective_date))
+            && chain
+                .iter()
+                .all(|cert| !cert.has_unchecked_critical_extension(&CHECKED_CRITICAL))
+            && is_ca(root, 1)
+            && is_ca(&intermediate, 0)
+            && is_signer(&leaf)
+            && leaf.has_extension(&APPLE_RECEIPT_SIGNER_OID)
+            && intermediate.has_extension(&APPLE_WWDR_INTERMEDIATE_OID)
+            && (!self.strict_checks
+                || (meets_strict_rules(&leaf, false, true)
+                    && meets_strict_rules(&intermediate, true, true)
+                    && meets_strict_rules(root, true, false)));
+        if !holds {
+            return Err(failure(ChainVerificationFailureReason::InvalidChain));
         }
 
-        let validation_time = effective_date
-            .map(|d| i64::try_from(d).unwrap_or(i64::MAX))
-            .unwrap_or_else(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0)
-            });
-
-        let policy = x509_validator::policy! {
-            RFC5280Policy::new(validation_time);
-            AppStoreOidPolicy::new()
-        };
-
-        let validator = x509_validator::Validator::with_policy(roots, policy);
-
-        let mut intermediates = CertificateStore::new();
-        intermediates.append(intermediate);
-
-        match validator.validate_with_diagnostics(&leaf, &intermediates, &mut |_| {}) {
-            Ok(chain) => Ok(leaf_spki_der(chain.leaf())),
-            Err(_reasons) => Err(ChainVerifierError::VerificationFailure(
-                ChainVerificationFailureReason::InvalidCertificate,
-            )),
+        if let Some(fetcher) = ocsp {
+            ocsp::check(fetcher, &intermediate, root, now)?;
+            ocsp::check(fetcher, &leaf, &intermediate, now)?;
         }
+
+        leaf.cert
+            .tbs_certificate()
+            .subject_public_key_info()
+            .to_der()
+            .map_err(|_| failure(ChainVerificationFailureReason::InvalidCertificate))
     }
 
     fn cached_public_key(&self, leaf: &[u8], intermediate: &[u8], now: u64) -> Option<Vec<u8>> {
@@ -267,14 +276,80 @@ impl ChainVerifier {
     }
 }
 
-fn parse_certificate(der: &[u8]) -> Result<Certificate<'_>, ChainVerifierError> {
-    Certificate::parse(der)
-        .map_err(|_| ChainVerifierError::VerificationFailure(ChainVerificationFailureReason::InvalidCertificate))
+#[cfg(test)]
+mod tests;
+
+fn failure(reason: ChainVerificationFailureReason) -> ChainVerifierError {
+    ChainVerifierError::VerificationFailure(reason)
 }
 
-fn leaf_spki_der(leaf: &Certificate) -> Vec<u8> {
-    leaf.tbs_certificate
-        .subject_pki
-        .raw
-        .to_vec()
+fn parse(der: &[u8]) -> Result<Cert<'_>, ChainVerifierError> {
+    Cert::parse(der).map_err(|_| failure(ChainVerificationFailureReason::InvalidCertificate))
+}
+
+/// Whether `cert` may issue certificates with `below` more CAs under it: basic constraints say
+/// it's a CA with room for them, and its key usage, when present, includes keyCertSign.
+fn is_ca(cert: &Cert<'_>, below: u8) -> bool {
+    let tbs = cert.cert.tbs_certificate();
+    let ca = matches!(
+        tbs.get_extension::<BasicConstraints>(),
+        Ok(Some((_, constraints))) if constraints.ca && constraints.path_len_constraint.is_none_or(|room| room >= below)
+    );
+    let signs_certificates = match tbs.get_extension::<KeyUsage>() {
+        Ok(None) => true,
+        Ok(Some((_, usage))) => usage.key_cert_sign(),
+        Err(_) => false,
+    };
+    ca && signs_certificates
+}
+
+/// Whether the leaf is an end entity that may sign: not a CA, and its key usage, when
+/// present, includes digitalSignature.
+fn is_signer(cert: &Cert<'_>) -> bool {
+    let tbs = cert.cert.tbs_certificate();
+    let end_entity = match tbs.get_extension::<BasicConstraints>() {
+        Ok(None) => true,
+        Ok(Some((_, constraints))) => !constraints.ca,
+        Err(_) => false,
+    };
+    let signs = match tbs.get_extension::<KeyUsage>() {
+        Ok(None) => true,
+        Ok(Some((_, usage))) => usage.digital_signature(),
+        Err(_) => false,
+    };
+    end_entity && signs
+}
+
+/// Whether `cert` meets the strict rules (see the module's documentation), as a CA or not, and
+/// as a certificate that names its issuer's key or not (the root doesn't need to).
+fn meets_strict_rules(cert: &Cert<'_>, ca: bool, names_issuer_key: bool) -> bool {
+    let tbs = cert.cert.tbs_certificate();
+    let (Ok(constraints), Ok(usage), Ok(subject_key), Ok(authority_key)) = (
+        tbs.get_extension::<BasicConstraints>(),
+        tbs.get_extension::<KeyUsage>(),
+        tbs.get_extension::<SubjectKeyIdentifier>(),
+        tbs.get_extension::<AuthorityKeyIdentifier>(),
+    ) else {
+        return false;
+    };
+    let signs_certificates = usage
+        .as_ref()
+        .is_some_and(|(_, usage)| usage.key_cert_sign());
+    let path_length = constraints
+        .as_ref()
+        .is_some_and(|(_, c)| c.path_len_constraint.is_some());
+
+    let named = !tbs.issuer().is_empty() && !tbs.subject().is_empty();
+    let as_ca = if ca {
+        constraints
+            .as_ref()
+            .is_some_and(|(critical, _)| *critical)
+            && usage.is_some()
+            && subject_key.is_some()
+    } else {
+        !path_length && !signs_certificates
+    };
+    let issuer_key = !names_issuer_key || authority_key.is_some_and(|(_, id)| id.key_identifier.is_some());
+
+    tbs.version() == Version::V3 && named && as_ca && issuer_key
 }

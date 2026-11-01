@@ -73,9 +73,12 @@ pub fn verifier() -> SignedDataVerifier {
         Environment::Sandbox,
         "com.example".to_string(),
         Some(1234),
-        false,
+        None,
     )
     .expect("valid verifier configuration")
+    // The synthetic test certificates have no key identifiers, so strict
+    // checks are off, as in Apple's own tests.
+    .with_strict_checks(false)
 }
 
 pub struct Inputs {

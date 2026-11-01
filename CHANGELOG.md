@@ -2,6 +2,47 @@
 
 All notable changes to this project are documented in this file.
 
+## [7.0.0]
+
+MarsoosHQ's fork. Certificate chains are checked the way Apple's own libraries check them, and online checks ask Apple's OCSP responders again.
+
+### Added
+
+- **OCSP revocation checks** during online checks, as Apple's libraries make them (RFC 6960). The intermediate and the leaf are each checked with the responders named in their Authority Information Access. An answer counts only when all of these hold:
+  - it's signed by the certificate's issuer, or by a responder the issuer delegated to (with the OCSP signing extended key usage);
+  - it's about this certificate;
+  - it says the certificate is good;
+  - it's fresh, give or take 60 seconds.
+
+  The crate does no networking: the caller supplies an `OcspFetcher` (the new `ocsp` module).
+- `SignedDataVerifierError::is_retryable()`: an OCSP responder couldn't be reached.
+- **Strict checks**, on by default, as in Apple's libraries (OpenSSL's `X509_STRICT`):
+  - every certificate is version 3, with non-empty names;
+  - a CA has critical basic constraints, key usage and a subject key identifier;
+  - the leaf and the intermediate have an authority key identifier;
+  - only a CA has a path length or keyCertSign.
+
+  `ChainVerifier::with_strict_checks` and `SignedDataVerifier::with_strict_checks` turn them off, for test certificates.
+- The failure reasons `InvalidChain`, `RevocationCheckFailed` and `RetryableVerificationFailure`.
+
+### Changed
+
+- **Breaking:** `SignedDataVerifier::new` takes `online_checks: Option<Arc<dyn OcspFetcher>>` instead of `enable_online_checks: bool`. Online checks require the certificates to be valid now, ask the OCSP responders, and remember a verified chain for 15 minutes.
+- **Breaking:** `ChainVerifier::verify` and `verify_at` take `ocsp: Option<&dyn OcspFetcher>` instead of a `bool`.
+- This crate now verifies certificate chains itself, on RustCrypto (`x509-cert`, `p256`, `p384`), instead of through `x509-validator`. That holds whichever backend signs and verifies the JWS. The checks follow Apple's:
+  - the names and signatures that link the chain (ECDSA with SHA-256 or SHA-384, the outer and inner algorithms the same);
+  - validity dates;
+  - CA basic constraints, key usage and path lengths;
+  - a leaf that may sign and isn't a CA;
+  - no critical extension left unchecked;
+  - Apple's OIDs.
+- A chain that doesn't verify now fails with `InvalidChain`. `InvalidCertificate` now means a certificate that can't be read, or no trusted roots.
+
+### Removed
+
+- The `x509-validator` dependency.
+- The `chain/verify_cached` benchmark: caching needs online checks, and online checks need an OCSP responder.
+
 ## [6.0.1]
 
 ### Added

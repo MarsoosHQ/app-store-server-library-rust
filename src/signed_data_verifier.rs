@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use base64::engine::general_purpose::STANDARD;
 use base64::{DecodeError, Engine};
 use serde::de::DeserializeOwned;
@@ -11,6 +13,7 @@ use crate::models::decoded_signed_data::DecodedSignedData;
 use crate::models::jws_renewal_info_decoded_payload::JWSRenewalInfoDecodedPayload;
 use crate::models::jws_transaction_decoded_payload::JWSTransactionDecodedPayload;
 use crate::models::response_body_v2_decoded_payload::ResponseBodyV2DecodedPayload;
+use crate::ocsp::OcspFetcher;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SignedDataVerifierError {
@@ -39,6 +42,19 @@ pub enum SignedDataVerifierError {
     InternalJWSError(#[from] crate::crypto::jws::JwsError),
 }
 
+impl SignedDataVerifierError {
+    /// Whether trying again later may succeed: an OCSP responder couldn't be reached during
+    /// online checks, so the data's certificates couldn't be checked yet.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::InternalChainVerifierError(ChainVerifierError::VerificationFailure(
+                ChainVerificationFailureReason::RetryableVerificationFailure
+            ))
+        )
+    }
+}
+
 const EXPECTED_CHAIN_LENGTH: usize = 3;
 
 ///A verifier and decoder class designed to decode signed data from the App Store.
@@ -46,7 +62,7 @@ pub struct SignedDataVerifier {
     environment: Environment,
     bundle_id: String,
     app_apple_id: Option<i64>,
-    enable_online_checks: bool,
+    online_checks: Option<Arc<dyn OcspFetcher>>,
     chain_verifier: ChainVerifier,
 }
 
@@ -60,8 +76,10 @@ impl SignedDataVerifier {
     /// * `bundle_id` - The bundle ID associated with the application.
     /// * `app_apple_id` - An optional Apple ID associated with the application. Required when
     ///   `environment` is `Environment::Production`.
-    /// * `enable_online_checks` - Whether to check certificate expiration against the
-    ///   current date rather than the JWS's signed date, and cache the verified public key.
+    /// * `online_checks` - With an OCSP fetcher, online checks, as Apple's libraries make them:
+    ///   the certificates must be valid now (rather than when the data was signed), Apple's
+    ///   OCSP responders are asked whether they've been revoked, and a verified chain's key is
+    ///   remembered for 15 minutes. `None` checks the chain offline, at the data's signed date.
     ///
     /// # Returns
     ///
@@ -73,7 +91,7 @@ impl SignedDataVerifier {
         environment: Environment,
         bundle_id: String,
         app_apple_id: Option<i64>,
-        enable_online_checks: bool,
+        online_checks: Option<Arc<dyn OcspFetcher>>,
     ) -> Result<Self, SignedDataVerifierError> {
         if environment == Environment::Production && app_apple_id.is_none() {
             return Err(SignedDataVerifierError::InvalidAppAppleId);
@@ -83,9 +101,18 @@ impl SignedDataVerifier {
             environment,
             bundle_id,
             app_apple_id,
-            enable_online_checks,
+            online_checks,
             chain_verifier: ChainVerifier::new(root_certificates),
         })
+    }
+
+    /// Turns the certificate chain's strict checks on or off: see
+    /// [`ChainVerifier::with_strict_checks`]. They're on by default.
+    pub fn with_strict_checks(mut self, enabled: bool) -> Self {
+        self.chain_verifier = self
+            .chain_verifier
+            .with_strict_checks(enabled);
+        self
     }
 }
 
@@ -330,20 +357,20 @@ impl SignedDataVerifier {
 
         let decoded_body: T = jws::decode_payload(signed_obj)?;
 
-        let effective_date = if self.enable_online_checks {
-            chrono::Utc::now().timestamp() as u64
-        } else {
-            match decoded_body.signed_date_optional() {
-                Some(date) => date.timestamp() as u64,
-                None => chrono::Utc::now().timestamp() as u64,
-            }
+        // Online, the certificates must be valid now; offline, when the data was signed (now
+        // when it carries no date).
+        let effective_date = match self.online_checks {
+            Some(_) => None,
+            None => decoded_body
+                .signed_date_optional()
+                .map(|date| date.timestamp() as u64),
         };
 
         let spki = self.chain_verifier.verify(
             &chain[0],
             &chain[1],
-            Some(effective_date),
-            self.enable_online_checks,
+            effective_date,
+            self.online_checks.as_deref(),
         )?;
 
         let signature_bytes = jws::decode_signature_bytes(signed_obj)?;
@@ -386,7 +413,7 @@ mod tests {
             Environment::Production,
             "com.example".into(),
             Some(1234),
-            false,
+            None,
         )
         .expect("valid config");
 
@@ -398,5 +425,125 @@ mod tests {
                 InvalidChainLength
             ))
         ));
+    }
+
+    /// Online checks through the verifier: the chain's responders are asked, and the
+    /// certificates must be valid now rather than when the data was signed.
+    #[cfg(any(feature = "rust_crypto", feature = "aws_lc", feature = "ring"))]
+    mod online {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use p256::ecdsa::signature::Signer;
+
+        use super::*;
+        use crate::chain_verifier::ChainVerificationFailureReason::{InvalidChain, RevocationCheckFailed};
+        use crate::test_chain::{Chain, Responder, Shape, INTERMEDIATE_OCSP_URL, LEAF_OCSP_URL};
+
+        fn now() -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        }
+
+        /// A chain whose certificates are valid from a day ago, for as long as the test runs.
+        fn chain() -> &'static Chain {
+            Box::leak(Box::new(Chain::shaped_at(Shape::apple_test(), now())))
+        }
+
+        /// A transaction signed by the chain's leaf on `signed_date` (Unix seconds).
+        fn transaction(chain: &Chain, signed_date: u64) -> String {
+            let x5c = [&chain.leaf, &chain.intermediate, &chain.root].map(|der| STANDARD.encode(der));
+            let header = serde_json::json!({ "alg": "ES256", "x5c": x5c });
+            let payload = serde_json::json!({
+                "bundleId": "com.example",
+                "environment": "Production",
+                "signedDate": signed_date * 1000,
+            });
+            let input = format!(
+                "{}.{}",
+                jws::b64url_encode(header.to_string().as_bytes()),
+                jws::b64url_encode(payload.to_string().as_bytes())
+            );
+
+            let signature: p256::ecdsa::Signature = chain.leaf_key.sign(input.as_bytes());
+            format!("{input}.{}", jws::b64url_encode(&signature.to_bytes()))
+        }
+
+        fn verifier(chain: &Chain, online_checks: Option<Arc<dyn OcspFetcher>>) -> SignedDataVerifier {
+            SignedDataVerifier::new(
+                vec![chain.root.clone()],
+                Environment::Production,
+                "com.example".into(),
+                Some(1234),
+                online_checks,
+            )
+            .unwrap()
+            .with_strict_checks(false)
+        }
+
+        fn chain_failure(reason: ChainVerificationFailureReason) -> SignedDataVerifierError {
+            SignedDataVerifierError::InternalChainVerifierError(ChainVerifierError::VerificationFailure(reason))
+        }
+
+        #[test]
+        fn online_checks_ask_the_responders_and_use_the_time_now() {
+            let chain = chain();
+            let responder = Arc::new(Responder::new(chain));
+            // Signed before the certificates were issued: only valid now.
+            let signed_long_ago = transaction(chain, now() - 30 * 86_400);
+
+            let result =
+                verifier(chain, Some(responder.clone())).verify_and_decode_signed_transaction(&signed_long_ago);
+
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(responder.asked(), [INTERMEDIATE_OCSP_URL, LEAF_OCSP_URL]);
+        }
+
+        #[test]
+        fn offline_checks_use_the_signed_date() {
+            let chain = chain();
+
+            let signed_long_ago = transaction(chain, now() - 30 * 86_400);
+            let error = verifier(chain, None)
+                .verify_and_decode_signed_transaction(&signed_long_ago)
+                .unwrap_err();
+            assert_eq!(error.to_string(), chain_failure(InvalidChain).to_string());
+
+            let signed_now = transaction(chain, now());
+            let result = verifier(chain, None).verify_and_decode_signed_transaction(&signed_now);
+            assert!(result.is_ok(), "{result:?}");
+        }
+
+        #[test]
+        fn an_unreachable_responder_is_retryable() {
+            let chain = chain();
+            let responder = Arc::new(Responder {
+                reachable: false,
+                ..Responder::new(chain)
+            });
+
+            let error = verifier(chain, Some(responder))
+                .verify_and_decode_signed_transaction(&transaction(chain, now()))
+                .unwrap_err();
+
+            assert!(error.is_retryable(), "{error:?}");
+        }
+
+        #[test]
+        fn a_revoked_certificate_is_not_retryable() {
+            let chain = chain();
+            let responder = Arc::new(Responder::revoked(chain));
+
+            let error = verifier(chain, Some(responder))
+                .verify_and_decode_signed_transaction(&transaction(chain, now()))
+                .unwrap_err();
+
+            assert!(!error.is_retryable());
+            assert_eq!(
+                error.to_string(),
+                chain_failure(RevocationCheckFailed).to_string()
+            );
+        }
     }
 }

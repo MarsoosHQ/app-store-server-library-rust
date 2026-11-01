@@ -10,7 +10,9 @@ fn chain(c: &mut Criterion) {
     app_store_server_library_bench_measure::assert_pinned_backend();
 
     let (leaf, intermediate, root) = bench::test_chain();
-    let verifier = ChainVerifier::new(vec![root]);
+    // The synthetic certificates have no key identifiers, so strict checks are
+    // off, as in Apple's own tests.
+    let verifier = ChainVerifier::new(vec![root]).with_strict_checks(false);
     // The synthetic chain's own validity window; these certs are valid
     // 2023-01-05 to 2033-01-01, so any time inside that range works.
     let test_chain_time: u64 = 1700000000;
@@ -20,7 +22,7 @@ fn chain(c: &mut Criterion) {
                 black_box(&leaf),
                 black_box(&intermediate),
                 Some(test_chain_time),
-                false,
+                None,
                 test_chain_time,
             ))
             .is_ok()
@@ -35,33 +37,8 @@ fn chain(c: &mut Criterion) {
                 black_box(&real_leaf),
                 black_box(&real_intermediate),
                 Some(bench::EFFECTIVE_DATE),
-                false,
+                None,
                 bench::EFFECTIVE_DATE,
-            ))
-            .is_ok()
-        })
-    });
-
-    // The one benchmark that enables caching. Named so it cannot be mistaken
-    // for cold verification: after the first iteration this is a HashMap
-    // lookup keyed on the certificate bytes, which is exactly the point —
-    // it measures what a caching caller actually pays on a repeat call.
-    let cached_verifier = ChainVerifier::new(vec![bench::root_ca_der()]);
-    let _ = cached_verifier.verify_at(
-        &leaf,
-        &intermediate,
-        Some(test_chain_time),
-        true,
-        test_chain_time,
-    );
-    c.bench_function("chain/verify_cached", |b| {
-        b.iter(|| {
-            black_box(cached_verifier.verify_at(
-                black_box(&leaf),
-                black_box(&intermediate),
-                Some(test_chain_time),
-                true,
-                test_chain_time,
             ))
             .is_ok()
         })

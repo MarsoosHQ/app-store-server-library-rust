@@ -23,12 +23,9 @@ Minor issues with no exploitable consequence — a documentation error, a
 confusing API — are fine to file on the public
 [issue tracker](https://github.com/namecare/app-store-server-library-rust/issues).
 
-Certificate chain verification is delegated to the
-[x509-validator](https://github.com/namecare/x509-validator) crate. If the
-issue is in that code rather than in this crate, report it under
-[its security policy](https://github.com/namecare/x509-validator/security/policy)
-instead; either address reaches the same team, so a misfiled report is
-forwarded rather than dropped.
+Certificate chain verification and OCSP revocation checks are part of this
+crate (`src/chain_verifier.rs`, `src/ocsp.rs` and `src/x509.rs`), built on
+RustCrypto's `x509-cert`, `p256` and `p384`.
 
 ## Advisories
 

@@ -1,7 +1,7 @@
 [package]
 name = "app-store-server-library"
 description = "The Rust server library for the App Store Server API, App Store Server Notifications and Advanced Commerce API"
-version = "6.0.1"
+version = "7.0.0"
 repository = "https://github.com/namecare/app-store-server-library-rust"
 homepage = "https://github.com/namecare/app-store-server-library-rust"
 authors = ["tkhp", "namecare"]
@@ -14,13 +14,19 @@ rust-version = "1.88"
 
 [dependencies]
 
-x509-validator = { version = "0.3.1", default-features = false }
+# Apple's certificate chains and their OCSP revocation checks, verified with RustCrypto
+# whichever backend signs and verifies the JWS itself.
+x509-cert = { version = "0.3.0", default-features = false }
+der = { version = "0.8.1", features = ["alloc", "derive", "oid"] }
+spki = "0.8.0"
+const-oid = "0.10.2"
+p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.14.0", features = ["ecdsa"] }
+sha1 = "0.11.0"
+sha2 = { version = "0.11.0", features = ["oid"] }
 
 # Cryptography - RustCrypto backend (optional)
-p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"], optional = true }
-p384 = { version = "0.14.0", features = ["ecdsa"], optional = true }
 rsa = { version = "0.10.0-rc.18", optional = true }
-sha2 = { version = "0.11.0", features = ["oid"], optional = true }
 pem-rfc7468 = { version = "1.0.0", optional = true }
 signature = { version = "3.0.0", optional = true }
 
@@ -55,21 +61,15 @@ regex = { version = "1.13.1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["test-util", "macros"] }
+# Builds test chains and OCSP responders, as Apple's own tests generate them.
+x509-cert = { version = "0.3.0", features = ["builder"] }
 
 [features]
 default = []
 
-rust_crypto = [
-  "dep:pem-rfc7468",
-  "dep:p256",
-  "dep:p384",
-  "dep:rsa",
-  "dep:sha2",
-  "dep:signature",
-  "x509-validator/rust_crypto",
-]
-aws_lc = ["dep:aws-lc-rs", "dep:asn1-rs", "x509-validator/aws_lc"]
-ring = ["dep:ring", "dep:asn1-rs", "x509-validator/ring"]
+rust_crypto = ["dep:pem-rfc7468", "dep:rsa", "dep:signature"]
+aws_lc = ["dep:aws-lc-rs", "dep:asn1-rs"]
+ring = ["dep:ring", "dep:asn1-rs"]
 
 api-client = ["dep:http"]
 api-client-reqwest = ["api-client", "dep:reqwest", "reqwest-tls-rustls"]

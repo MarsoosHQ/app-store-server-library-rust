@@ -17,7 +17,7 @@ Specify `app-store-server-library` in your project's `Cargo.toml` file, under th
 
 ```toml
 [dependencies]
-app-store-server-library = { version = "6.0.1", features = ["aws_lc", "receipt-utility", "api-client-reqwest"] }
+app-store-server-library = { version = "7.0.0", features = ["aws_lc", "receipt-utility", "api-client-reqwest"] }
 ```
 
 ### Feature Flags
@@ -30,7 +30,7 @@ There are no default features.
 - `ring` - [ring](https://github.com/briansmith/ring) backend.
 - `rust_crypto` - Pure-Rust backend.
 
-The backend is also forwarded to the [`x509-validator`](https://crates.io/crates/x509-validator) dependency used for certificate chain verification, so the whole crate ends up on a single crypto stack.
+The backend signs and verifies JWS. Certificate chains and OCSP responses are always checked with RustCrypto ([`x509-cert`](https://crates.io/crates/x509-cert), [`p256`](https://crates.io/crates/p256) and [`p384`](https://crates.io/crates/p384)), whichever backend you pick.
 
 #### API client
 
@@ -144,14 +144,57 @@ let verifier = SignedDataVerifier::new(
     Environment::Sandbox, // Environment
     "app.superapp.apple".to_string(), // Bundle id
     Some(12345678), // App id — required in Production
-    false, // enable_online_checks
+    None, // Online checks: Some(Arc<dyn OcspFetcher>) to make them
 ).unwrap();
 
 let payload = "signed-payload";
 let decoded_payload = verifier.verify_and_decode_notification(payload).unwrap();
 ```
 
-Certificate chain verification is delegated to the [`x509-validator`](https://github.com/namecare/x509-validator) crate, which runs on the same crypto backend you selected above.
+The certificate chain is checked as Apple's own libraries check it, including the strict rules they turn on by default (OpenSSL's `X509_STRICT`). Apple's test certificates don't meet those rules, so turn them off with `.with_strict_checks(false)` only when you test against them.
+
+#### Online checks
+
+Pass an `OcspFetcher` to make online checks, as Apple's libraries do:
+
+- the certificates must be valid now, rather than when the data was signed;
+- Apple's OCSP responders are asked whether the intermediate or the leaf has been revoked;
+- a verified chain is remembered for 15 minutes.
+
+The crate does no networking itself. The fetcher posts the request with your own HTTP client:
+
+```rust
+use std::sync::Arc;
+
+use app_store_server_library::ocsp::{OcspFetchError, OcspFetcher};
+
+struct Fetcher(reqwest::blocking::Client);
+
+impl OcspFetcher for Fetcher {
+    fn fetch(&self, url: &str, request: &[u8]) -> Result<Vec<u8>, OcspFetchError> {
+        let failed = |e: reqwest::Error| OcspFetchError(e.to_string());
+        let response = self
+            .0
+            .post(url)
+            .header("Content-Type", "application/ocsp-request")
+            .body(request.to_vec())
+            .send()
+            .and_then(|r| r.error_for_status())
+            .map_err(failed)?;
+        Ok(response.bytes().map_err(failed)?.to_vec())
+    }
+}
+
+let verifier = SignedDataVerifier::new(
+    vec![root_cert_der],
+    Environment::Production,
+    "app.superapp.apple".to_string(),
+    Some(12345678),
+    Some(Arc::new(Fetcher(reqwest::blocking::Client::new()))),
+).unwrap();
+```
+
+If a responder can't be reached, or doesn't answer `200`, verification fails with an error whose `is_retryable()` is true: try again later.
 
 ### Receipt Usage
 ```rust

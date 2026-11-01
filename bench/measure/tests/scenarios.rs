@@ -69,7 +69,7 @@ fn decode_group_skips_verification() {
         Environment::Xcode,
         "com.example.naturelab.backyardbirds.example".to_string(),
         Some(531412),
-        false,
+        None,
     )
     .expect("valid configuration");
 
@@ -86,11 +86,11 @@ fn decode_group_skips_verification() {
 #[test]
 fn chain_cases_validate() {
     let (leaf, intermediate, root) = bench::test_chain();
-    let verifier = ChainVerifier::new(vec![root]);
+    let verifier = ChainVerifier::new(vec![root]).with_strict_checks(false);
     let t: u64 = 1700000000;
     assert!(
         verifier
-            .verify_at(&leaf, &intermediate, Some(t), false, t)
+            .verify_at(&leaf, &intermediate, Some(t), None, t)
             .is_ok(),
         "chain/verify_test_chain must validate"
     );
@@ -102,7 +102,7 @@ fn chain_cases_validate() {
             &real_leaf,
             &real_intermediate,
             Some(bench::EFFECTIVE_DATE),
-            false,
+            None,
             bench::EFFECTIVE_DATE
         )
         .is_ok(),
@@ -110,36 +110,17 @@ fn chain_cases_validate() {
     );
 }
 
-/// Pins hazard 1: with online checks on, a repeat verification is served from
-/// the cache. If this ever stops holding, `chain/verify_cached` is measuring
-/// something else and the other benchmarks' `false` is no longer meaningful.
-#[test]
-fn cache_engages_when_online_checks_enabled() {
-    let (leaf, intermediate, root) = bench::test_chain();
-    let verifier = ChainVerifier::new(vec![root]);
-    let t: u64 = 1700000000;
-
-    assert_eq!(verifier.cache_len(), 0, "cache starts empty");
-    verifier
-        .verify_at(&leaf, &intermediate, Some(t), true, t)
-        .expect("first verification succeeds");
-    assert_eq!(
-        verifier.cache_len(),
-        1,
-        "online checks must populate the cache"
-    );
-}
-
-/// The converse: with online checks off — the setting every other benchmark
-/// uses — nothing is cached, so each iteration does the full work.
+/// With online checks off — the setting every benchmark uses — nothing is
+/// cached, so each iteration does the full work. (Online checks need an OCSP
+/// fetcher; the library's own tests cover their cache.)
 #[test]
 fn cache_stays_empty_when_online_checks_disabled() {
     let (leaf, intermediate, root) = bench::test_chain();
-    let verifier = ChainVerifier::new(vec![root]);
+    let verifier = ChainVerifier::new(vec![root]).with_strict_checks(false);
     let t: u64 = 1700000000;
 
     verifier
-        .verify_at(&leaf, &intermediate, Some(t), false, t)
+        .verify_at(&leaf, &intermediate, Some(t), None, t)
         .expect("verification succeeds");
     assert_eq!(
         verifier.cache_len(),

@@ -24,7 +24,7 @@ Every run writes plots and an index page. Open it with:
 | Bench | Groups | Benchmarks | Notes |
 |---|---|---|---|
 | `verify` | `verify/`, `decode/` | 6 | full verify path vs. Xcode parse-only path |
-| `chain` | `chain/` | 3 | `ChainVerifier` in isolation, including the caching hazard |
+| `chain` | `chain/` | 2 | `ChainVerifier` in isolation, offline (online checks need an OCSP responder) |
 | `sign` | `sign/` | 4 | the four public signature creators |
 | `receipt` | `receipt/` | 4 | both public receipt extractors |
 | `jws` | `jws/` | 3 | the JWS helpers called on every verification |

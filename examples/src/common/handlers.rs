@@ -12,7 +12,7 @@ use app_store_server_library::promotional_offer_signature_creator::PromotionalOf
 use app_store_server_library::signed_data_verifier::SignedDataVerifier;
 use serde::{Deserialize, Serialize};
 
-use crate::common::certs::load_roots;
+use crate::common::certs::{load_roots, RootSource};
 use crate::common::config::Config;
 use crate::common::error::AppError;
 
@@ -29,13 +29,17 @@ pub struct AppState {
 pub fn state(config: &Config) -> Result<Arc<AppState>, Box<dyn std::error::Error>> {
     let roots = load_roots(&config.root_source)?;
 
+    // The bundled test CA has no key identifiers, so demo mode turns the strict checks off,
+    // as Apple's own tests do. Apple's real roots keep them.
+    let demo = matches!(config.root_source, RootSource::Demo);
     let verifier = SignedDataVerifier::new(
         roots,
         config.environment.clone(),
         config.bundle_id.clone(),
         config.app_apple_id,
-        false,
-    )?;
+        None,
+    )?
+    .with_strict_checks(!demo);
 
     let promo = PromotionalOfferSignatureCreator::new(
         &config.promo_key_pem,
@@ -186,7 +190,6 @@ mod tests {
     use app_store_server_library::models::app_store_environment::Environment;
 
     use super::*;
-    use crate::common::certs::RootSource;
 
     /// A config matching the bundled fixture: demo CA, com.example, sandbox.
     fn demo_config() -> Config {

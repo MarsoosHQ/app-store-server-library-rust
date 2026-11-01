@@ -68,17 +68,20 @@ pub fn fixture(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {path}: {e}"))
 }
 
-/// A verifier with online checks **off** — see the crate-level constraint.
-/// Enabling them turns every subsequent verification into a cache hit.
+/// A verifier with online checks **off** (no OCSP fetcher) — see the
+/// crate-level constraint. Enabling them turns every subsequent verification
+/// into a cache hit. Strict checks are off too: the synthetic test
+/// certificates have no key identifiers (Apple's tests turn them off as well).
 pub fn verifier(environment: Environment, bundle_id: &str, app_apple_id: Option<i64>) -> SignedDataVerifier {
     SignedDataVerifier::new(
         vec![root_ca_der()],
         environment,
         bundle_id.to_string(),
         app_apple_id.or(Some(1234)),
-        false,
+        None,
     )
     .expect("valid verifier configuration")
+    .with_strict_checks(false)
 }
 
 /// The verifier the `verify/` group uses: Sandbox, so the full chain and

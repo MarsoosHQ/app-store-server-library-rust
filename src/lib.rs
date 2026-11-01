@@ -2,8 +2,12 @@ pub mod chain_verifier;
 pub mod crypto;
 pub mod jws_signature_creator;
 pub mod models;
+pub mod ocsp;
 pub mod promotional_offer_signature_creator;
 pub mod signed_data_verifier;
+#[cfg(test)]
+mod test_chain;
+mod x509;
 
 #[cfg(feature = "receipt-utility")]
 pub mod receipt_utility;

@@ -1,5 +1,6 @@
 use std::fs;
 
+use app_store_server_library::chain_verifier::{ChainVerificationFailureReason, ChainVerifierError};
 use app_store_server_library::crypto::{jws, CryptoProvider};
 use app_store_server_library::models::advanced_commerce_period::AdvancedCommercePeriod;
 use app_store_server_library::models::advanced_commerce_price_increase_info_status::AdvancedCommercePriceIncreaseInfoStatus;
@@ -326,9 +327,40 @@ fn get_signed_data_verifier(
         environment,
         bundle_id.to_string(),
         app_apple_id.or(Some(1234)),
-        false,
+        None,
     )
     .expect("valid config")
+    // The test certificates have no key identifiers, so strict checks are off, as in Apple's
+    // own tests.
+    .with_strict_checks(false)
+}
+
+#[test]
+fn test_strict_checks_refuse_the_test_certificates() {
+    let test_notification_data =
+        fs::read_to_string("tests/resources/mock_signed_data/testNotification").expect("Failed to read file");
+    let verifier = SignedDataVerifier::new(
+        vec![ROOT_CA_BASE64_ENCODED
+            .as_der_bytes()
+            .unwrap()],
+        Environment::Sandbox,
+        "com.example".to_string(),
+        Some(1234),
+        None,
+    )
+    .expect("valid config");
+
+    let error = verifier
+        .verify_and_decode_notification(&test_notification_data)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SignedDataVerifierError::InternalChainVerifierError(ChainVerifierError::VerificationFailure(
+            ChainVerificationFailureReason::InvalidChain
+        ))
+    ));
+    assert!(!error.is_retryable());
 }
 
 #[test]
